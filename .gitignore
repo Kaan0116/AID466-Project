@@ -1,0 +1,27 @@
+# Build ve install
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# ROS 2 build dosyaları (workspace root'ta yönetilir)
+# src/ içinde bunlar normalde yok ama yine de güvenli olsun
+build/
+install/
+log/
+
+# Sonuçlar (büyük dosyalar, repo'ya girmez)
+results/
+
+# Geçici
+*.log
+*.bag
+*.db3
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,9 @@
+follower_node:
+  ros__parameters:
+    target_gap:   1.2    # m — kişi arkası ile robot önü arası
+    kp_gap:       4.0    # P kazancı — yüksek kazanç, gazebo statik sürtünmesini aşmak için
+    kp_heading:   2.0    # P kazancı (yön hatası → açısal hız)
+    v_max:        1.5    # m/s — maksimum ileri hız
+    w_max:        1.2    # rad/s — maksimum açısal hız
+    v_person:     0.0    # m/s — 0.0 = statik, 1.0 = yürüme modu
+    log_csv:      ''     # doldurulursa CSV log yazar
