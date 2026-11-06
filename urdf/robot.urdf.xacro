@@ -23,8 +23,8 @@
       <geometry>
         <box size="${base_length} ${base_width} ${base_height}"/>
       </geometry>
-      <material name="yellow">
-        <color rgba="0.95 0.75 0.1 1"/>
+      <material name="orange">
+        <color rgba="1.0 0.4 0.0 1"/>
       </material>
     </visual>
     <collision>
