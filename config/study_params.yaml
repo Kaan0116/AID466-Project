@@ -1,0 +1,60 @@
+# Tek parametre kaynağı (single source of truth).
+# - ROS node'ları kendi bölümlerini (follower_node, person_driver) --params-file ile okur.
+# - Launch dosyaları ve scriptler aynı dosyayı following_study.study_config ile okur.
+# Kamera çözünürlüğü/FOV/yükseklik/eğim yalnızca models/person/model.sdf içinde tanımlıdır;
+# scriptler bu değerleri gelen görüntü mesajından okur, kopyalamaz.
+
+follower_node:
+  ros__parameters:
+    target_gap: 1.2            # m — kişinin arka yüzeyi ile robotun ön yüzeyi arası
+    kp_gap: 4.0                # mesafe hatası -> hız kazancı
+    kp_heading: 2.0            # yön hatası -> açısal hız kazancı
+    k_lateral: 0.4             # yanal sapma (rad/m) -> yön hatasına eklenir
+    v_max: 2.0                 # m/s — robotun maksimum ileri hızı (spec)
+    w_max: 1.5                 # rad/s — robotun maksimum açısal hızı (spec)
+    v_person: 1.0              # m/s — ileri besleme; launch'ta person_speed ile aynı değere ayarlanır
+    steady_tol: 0.02           # m — |hata| < steady_tol ...
+    steady_time: 2.0           # s — ... bu süre boyunca (sim zamanı) -> steady_state
+    person_back_offset: 0.20   # m — kişi merkezinden sırtına (gövde silindiri yarıçapı, model.sdf)
+    robot_front_offset: 0.255  # m — robot merkezinden ön yüzeyine (base_length/2, robot.urdf.xacro)
+    log_csv: ''                # doluysa her kontrol adımı (pozlar dahil) CSV'ye yazılır
+
+person_driver:
+  ros__parameters:
+    speed: 1.0                 # m/s — +x yönünde yürüme hızı (0.0 = statik)
+    start_delay: 3.0           # s (sim zamanı) — spawn sonrası bekleme
+    stop_x: 28.0               # m — kişi bu x'e ulaşınca durur (ön duvar x=30)
+
+study:
+  # Launch dosyaları ve scriptler için ayarlar (ROS parametre formatında; hiçbir node bunları kullanmaz)
+  ros__parameters:
+      spawn:
+        person_x: 12.0             # m — varsayılan (simülasyon / fotoğraf) kişi konumu
+        robot_z: 0.225             # m — robot base_link yüksekliği (tekerlek yarıçapı + boşluk)
+        spawn_offset: 0.3          # m — robot hedef mesafeden bu kadar geride başlar
+      stills:
+        gaps: [0.4, 0.6, 0.9, 1.2, 1.5, 2.0, 3.0]
+        tolerance: 0.03            # m — pozlardan hesaplanan gerçek mesafe toleransı
+        steady_timeout: 60.0       # s (sim) — steady_state beklenecek maksimum süre
+        settle_time: 1.0           # s (sim) — follower durdurulduktan sonra bekleme
+        max_attempts: 3            # tolerans dışıysa yeniden deneme sayısı
+      clips:
+        gaps: [0.6, 1.2, 2.0]
+        person_speed: 1.0          # m/s
+        person_x: 3.5              # m — 20 s yürüyüş + ısınma koridora sığsın diye
+        duration: 20.0             # s (sim zamanı)
+        fps: 30
+        warmup_timeout: 8.0        # s (sim) — kayıttan önce steady_state için en fazla bekleme
+      eval:
+        gaps: [0.6, 1.2, 2.0]
+        reps: 10
+        person_speed: 1.0
+        person_x: 3.5
+        duration: 22.0             # s (sim zamanı) / koşu
+        settle_time: 5.0           # s — RMSE bu andan sonra hesaplanır (geçici rejim hariç)
+        base_seed: 466
+        jitter_x: 0.10             # m — robot başlangıç konumu bozulması (seed'li)
+        jitter_y: 0.05             # m
+        jitter_yaw: 0.05           # rad
+        lost_bearing: 0.5236       # rad — kişi robot kamerasının yarı FOV'u (30°) dışına çıkarsa kayıp
+        lost_gap_margin: 1.5       # m — gap > hedef + bu değer ise kayıp

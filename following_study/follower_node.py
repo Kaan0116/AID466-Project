@@ -1,191 +1,207 @@
 #!/usr/bin/env python3
 """
-Kişi takip kontrolcüsü.
+Person-following controller.
 
-gap = kişinin arka yüzeyi ile robotun ön yüzeyi arasındaki +x mesafe.
-  person_back  = person_x - 0.225   (silindir yarıçapı)
-  robot_front  = robot_x  + 0.255   (base_length/2 = 0.255)
-  gap = person_back - robot_front
+gap (see following_study/geometry.py) = distance along the person's heading from the
+robot's FRONT edge to the person's BACK surface, using person_back_offset and
+robot_front_offset from config/study_params.yaml.
+
+    v = v_person + kp_gap * (gap - target_gap),  clamped to [0, v_max]
+    w = kp_heading * (heading_err - k_lateral * lateral),  clamped to [-w_max, w_max]
+    steady_state = |gap - target_gap| < steady_tol for steady_time seconds (ROS clock;
+                   use_sim_time:=true in every launch file, so this is simulation time)
+
+All parameters must come from the params file (no hidden defaults in code).
 """
 
-import math
+import signal
 import csv
 import os
 import time
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float64, Bool
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from std_msgs.msg import Float64, Bool, String
 
+from following_study.geometry import relation
 
-PERSON_RADIUS = 0.225   # m
-ROBOT_HALF    = 0.255   # m  (0.51 / 2)
-
-
-def yaw_from_quat(q):
-    siny = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny, cosy)
+DOUBLE_PARAMS = ['target_gap', 'kp_gap', 'kp_heading', 'k_lateral', 'v_max', 'w_max',
+                 'v_person', 'steady_tol', 'steady_time',
+                 'person_back_offset', 'robot_front_offset']
+ODOM_TIMEOUT = 0.5   # s — stop the robot if ground truth stops arriving
+DISCOVERY_WAIT = 5.0  # s (wall) — listen for an older follower before driving (DDS discovery ~3 s)
 
 
 class FollowerNode(Node):
 
     def __init__(self):
         super().__init__('follower_node')
-
-        # Parametreler
-        self.declare_parameter('target_gap',   1.2)
-        self.declare_parameter('kp_gap',       0.8)
-        self.declare_parameter('kp_heading',   1.5)
-        self.declare_parameter('v_max',        1.5)
-        self.declare_parameter('w_max',        1.2)
-        self.declare_parameter('v_person',     0.0)   # statik mod
-        self.declare_parameter('log_csv',      '')
-
+        for name in DOUBLE_PARAMS:
+            self.declare_parameter(name, Parameter.Type.DOUBLE)
+        self.declare_parameter('log_csv', '')
         self._read_params()
 
-        # Yayıncılar
-        self._cmd_pub       = self.create_publisher(Twist,   '/cmd_vel',          10)
-        self._gap_pub       = self.create_publisher(Float64, '/follower/gap',      10)
-        self._err_pub       = self.create_publisher(Float64, '/follower/gap_error',10)
-        self._steady_pub    = self.create_publisher(Bool,    '/follower/steady',   10)
+        self._cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._gap_pub = self.create_publisher(Float64, '/follower/gap', 10)
+        self._err_pub = self.create_publisher(Float64, '/follower/gap_error', 10)
+        self._steady_pub = self.create_publisher(Bool, '/follower/steady', 10)
 
-        # Aboneler
-        self._person_sub = self.create_subscription(
-            Odometry, '/person/odom', self._person_cb, 10)
-        self._robot_sub  = self.create_subscription(
-            Odometry, '/robot/odom',  self._robot_cb,  10)
+        self.create_subscription(Odometry, '/person/odom', self._person_cb, 10)
+        self.create_subscription(Odometry, '/robot/odom', self._robot_cb, 10)
 
-        # Durum
-        self._person_pose = None
-        self._robot_pose  = None
-        self._steady_timer = 0.0
+        self._person = None
+        self._robot = None
+        self._last_odom = None
         self._steady_start = None
 
-        # CSV log
-        self._csv_file   = None
-        self._csv_writer = None
-        log_path = self.get_parameter('log_csv').get_parameter_value().string_value
+        self._csv_file = None
+        self._csv = None
+        log_path = self.get_parameter('log_csv').value
         if log_path:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
-            self._csv_file   = open(log_path, 'w', newline='')
-            self._csv_writer = csv.writer(self._csv_file)
-            self._csv_writer.writerow(['time', 'gap', 'gap_error', 'v_cmd', 'w_cmd'])
+            if os.path.dirname(log_path):
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            self._csv_file = open(log_path, 'w', newline='')
+            self._csv = csv.writer(self._csv_file)
+            self._csv.writerow(['time', 'person_x', 'person_y', 'person_yaw',
+                                'robot_x', 'robot_y', 'robot_yaw',
+                                'gap', 'gap_error', 'lateral', 'steady', 'v_cmd', 'w_cmd'])
 
-        # Kontrol döngüsü 50 Hz
-        self._timer = self.create_timer(0.02, self._control_loop)
-        self.get_logger().info('follower_node başlatıldı.')
+        # --- single-follower guard -------------------------------------------------------
+        # Every follower announces (start wall time, pid) on a latched topic. A follower that
+        # hears an OLDER instance exits, so two controllers never fight over /cmd_vel,
+        # independent of how long DDS discovery takes.
+        self._born = time.time()
+        self._me = f'{self._born:.6f}:{os.getpid()}'
+        self._active = False
+        latched = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._inst_pub = self.create_publisher(String, '/follower/instance', latched)
+        self._inst_pub.publish(String(data=self._me))
+        self.create_subscription(String, '/follower/instance', self._instance_cb, latched)
+        steady = Clock(clock_type=ClockType.STEADY_TIME)
+        self._guard_timer = self.create_timer(DISCOVERY_WAIT, self._activate, clock=steady)
+
+        self.create_timer(0.02, self._control_loop)   # 50 Hz (ROS clock)
+        self.get_logger().info(
+            f'follower_node started: target_gap={self.p["target_gap"]:.2f} m, '
+            f'v_person={self.p["v_person"]:.2f} m/s')
 
     def _read_params(self):
-        self.target_gap  = self.get_parameter('target_gap').get_parameter_value().double_value
-        self.kp_gap      = self.get_parameter('kp_gap').get_parameter_value().double_value
-        self.kp_heading  = self.get_parameter('kp_heading').get_parameter_value().double_value
-        self.v_max       = self.get_parameter('v_max').get_parameter_value().double_value
-        self.w_max       = self.get_parameter('w_max').get_parameter_value().double_value
-        self.v_person    = self.get_parameter('v_person').get_parameter_value().double_value
+        try:
+            self.p = {n: self.get_parameter(n).value for n in DOUBLE_PARAMS}
+        except Exception as e:  # uninitialised parameter -> params file missing
+            raise RuntimeError(
+                'follower_node needs --params-file config/study_params.yaml') from e
+        if any(v is None for v in self.p.values()):
+            missing = [n for n, v in self.p.items() if v is None]
+            raise RuntimeError(f'follower_node: parameters not set: {missing}')
 
-    def _person_cb(self, msg: Odometry):
-        self._person_pose = msg.pose.pose
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
-    def _robot_cb(self, msg: Odometry):
-        self._robot_pose = msg.pose.pose
+    def _person_cb(self, msg):
+        self._person = msg.pose.pose
+        self._last_odom = self._now()
+
+    def _robot_cb(self, msg):
+        self._robot = msg.pose.pose
+        self._last_odom = self._now()
+
+    def _instance_cb(self, msg):
+        if msg.data == self._me:
+            return
+        other_born = float(msg.data.split(':')[0])
+        if other_born < self._born:
+            self.get_logger().fatal(
+                f'an older follower_node is running ({msg.data}) -> exiting. '
+                'Use start_follower:=false when a script starts its own follower.')
+            raise SystemExit(2)
+        self.get_logger().error(f'a newer follower_node appeared ({msg.data}); it should exit')
+
+    def _activate(self):
+        if not self._active:
+            self._active = True
+            self.get_logger().info('no older follower_node found, control active')
+        self._guard_timer.cancel()
 
     def _control_loop(self):
-        self._read_params()
-
-        if self._person_pose is None or self._robot_pose is None:
+        if not self._active:
+            return
+        self._read_params()   # allows `ros2 param set` at runtime (demo panel)
+        p = self.p
+        if self._person is None or self._robot is None:
+            return
+        now = self._now()
+        if now - self._last_odom > ODOM_TIMEOUT:
+            self._cmd_pub.publish(Twist())
             return
 
-        px = self._person_pose.position.x
-        py = self._person_pose.position.y
-        rx = self._robot_pose.position.x
-        ry = self._robot_pose.position.y
+        rel = relation(self._person, self._robot,
+                       p['person_back_offset'], p['robot_front_offset'])
+        gap_error = rel.gap - p['target_gap']
 
-        person_yaw = yaw_from_quat(self._person_pose.orientation)
-        robot_yaw  = yaw_from_quat(self._robot_pose.orientation)
+        v = p['v_person'] + p['kp_gap'] * gap_error
+        v = max(0.0, min(p['v_max'], v))
+        w = p['kp_heading'] * (rel.heading_err - p['k_lateral'] * rel.lateral)
+        w = max(-p['w_max'], min(p['w_max'], w))
 
-        # Kişiden robota vektör (kişi çerçevesinde)
-        dx = rx - px
-        dy = ry - py
-
-        # +x yönündeki (ileri) mesafe
-        # gap = kişi arka yüzeyi - robot ön yüzeyi
-        # kişi +x yönünde yürüdüğü için basitçe:
-        gap = -(dx * math.cos(person_yaw) + dy * math.sin(person_yaw)) \
-              - PERSON_RADIUS - ROBOT_HALF
-
-        gap_error = gap - self.target_gap
-
-        # Hız kontrolü: feedforward (kişi hızı) + P kazancı
-        # gap_error > 0 → robot çok uzak → hızlan; < 0 → çok yakın → yavaşla
-        v = self.v_person + self.kp_gap * gap_error
-        v = max(0.0, min(self.v_max, v))
-
-        # Yön hatası: robot kişinin arkasına bakmalı (person_yaw yönüne)
-        # Kişi +x yönünde ilerliyor; robot da +x bakmalı
-        heading_error = person_yaw - robot_yaw
-        # -pi..pi'ye normalize
-        heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
-
-        # Lateral hata: kişi ile aynı y'de olmak istiyoruz
-        lateral_error = py - ry
-        total_angular_error = heading_error + 0.4 * lateral_error
-
-        w = self.kp_heading * total_angular_error
-        w = max(-self.w_max, min(self.w_max, w))
-
-        # Steady-state flag: |gap_error| < 0.04 m, 2 s boyunca
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if abs(gap_error) < 0.04:
+        if abs(gap_error) < p['steady_tol']:
             if self._steady_start is None:
                 self._steady_start = now
-            steady = (now - self._steady_start) >= 2.0
+            steady = (now - self._steady_start) >= p['steady_time']
         else:
             self._steady_start = None
             steady = False
 
-        # Yayın
         cmd = Twist()
-        cmd.linear.x  = v
+        cmd.linear.x = v
         cmd.angular.z = w
         self._cmd_pub.publish(cmd)
+        self._gap_pub.publish(Float64(data=float(rel.gap)))
+        self._err_pub.publish(Float64(data=float(gap_error)))
+        self._steady_pub.publish(Bool(data=steady))
 
-        g_msg = Float64(); g_msg.data = float(gap)
-        self._gap_pub.publish(g_msg)
-
-        e_msg = Float64(); e_msg.data = float(gap_error)
-        self._err_pub.publish(e_msg)
-
-        s_msg = Bool(); s_msg.data = steady
-        self._steady_pub.publish(s_msg)
-
-        if self._csv_writer:
-            self._csv_writer.writerow([
-                f'{now:.3f}', f'{gap:.4f}', f'{gap_error:.4f}',
-                f'{v:.4f}', f'{w:.4f}'
-            ])
+        if self._csv:
+            pp, rp = self._person.position, self._robot.position
+            self._csv.writerow([f'{now:.3f}', f'{pp.x:.4f}', f'{pp.y:.4f}', f'{rel.person_yaw:.4f}',
+                                f'{rp.x:.4f}', f'{rp.y:.4f}', f'{rel.robot_yaw:.4f}',
+                                f'{rel.gap:.4f}', f'{gap_error:.4f}', f'{rel.lateral:.4f}',
+                                int(steady), f'{v:.4f}', f'{w:.4f}'])
 
     def destroy_node(self):
+        try:
+            self._cmd_pub.publish(Twist())
+        except Exception:
+            pass
         if self._csv_file:
-            self._csv_file.flush()
             self._csv_file.close()
         super().destroy_node()
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # Own SIGINT handling: Ctrl+C / launch shutdown -> KeyboardInterrupt -> zero command is sent
+    signal.signal(signal.SIGINT, signal.default_int_handler)   # even if the parent ignored SIGINT
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = FollowerNode()
+    code = 0
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except SystemExit as e:
+        code = e.code
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return code
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

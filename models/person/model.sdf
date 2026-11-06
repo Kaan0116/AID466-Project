@@ -31,7 +31,8 @@
       <parent>body_link</parent><child>leg_right_link</child>
     </joint>
 
-    <!-- ===== GÖVDE (silindir: r=0.2m, h=0.75m, merkez z=0.975m) ===== -->
+    <!-- ===== GÖVDE (silindir: r=0.2m, h=0.75m, merkez z=0.975m) =====
+         r=0.2 -> config/study_params.yaml: person_back_offset -->
     <link name="body_link">
       <pose>0 0 0.975 0 0 0</pose>
       <inertial>
@@ -93,9 +94,16 @@
         <material><ambient>0.88 0.72 0.57 1</ambient><diffuse>0.88 0.72 0.57 1</diffuse></material>
       </visual>
 
-      <!-- ===== BİRİNCİ ŞAHIS KAMERA (z=1.6m, geriye bakan) ===== -->
+      <!-- ===== BİRİNCİ ŞAHIS KAMERA =====
+           Tüm çalışmada TEK kamera tanımı burasıdır (scriptler çözünürlüğü mesajdan okur).
+           Konum (head_link'e göre): x=-0.16 (başın 4 cm arkası), z=+0.12 -> yerden 1.60 m.
+           Yön: yaw=pi (geriye bakar), pitch=0.80 rad (45.8° aşağı).
+           Neden eğim? 90° HFOV ve 16:9 -> dikey FOV 58.7°. Eğimsiz kamerada robot ancak
+           ~2.2 m'den uzaktayken kadraja girer. 0.80 rad ile robot 0.4 m ... 3.0 m arası
+           tüm mesafelerde tamamen kadrajdadır ve kişinin kendi gövdesi görünmez
+           (render ile doğrulandı). -->
       <sensor name="rear_cam" type="camera">
-        <pose>0 0 0.14 0 0 3.14159</pose>
+        <pose>-0.16 0 0.12 0 0.80 3.141592653589793</pose>
         <always_on>true</always_on>
         <update_rate>30</update_rate>
         <camera>
@@ -126,6 +134,9 @@
         <remapping>cmd_vel:=cmd_vel</remapping>
       </ros>
       <update_rate>100</update_rate>
+      <!-- Odometriyi yalnızca p3d yayınlasın (aksi halde /person/odom'da iki yayıncı olur) -->
+      <publish_odom>false</publish_odom>
+      <publish_odom_tf>false</publish_odom_tf>
     </plugin>
 
     <!-- ===== GROUND-TRUTH ODOM (p3d) ===== -->

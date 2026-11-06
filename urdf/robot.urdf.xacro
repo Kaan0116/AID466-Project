@@ -183,7 +183,9 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="camera_link"/>
-    <origin xyz="${base_length/2} 0 ${base_height/2 + 0.02}" rpy="0 0 0"/>
+    <!-- Kamera kutusu (0.04 m) gövdenin içinde kalır: ön yüzey = base_length/2 = 0.255 m
+         (config/study_params.yaml: robot_front_offset) -->
+    <origin xyz="${base_length/2 - 0.02} 0 ${base_height/2 + 0.02}" rpy="0 0 0"/>
   </joint>
 
   <!-- ============ GAZEBO PLUGİNLERİ ============ -->
@@ -202,8 +204,8 @@
       <wheel_diameter>${2*wheel_radius}</wheel_diameter>
       <max_wheel_torque>50</max_wheel_torque>
       <max_wheel_acceleration>5.0</max_wheel_acceleration>
-      <max_linear_velocity>2.0</max_linear_velocity>
-      <max_angular_velocity>1.5</max_angular_velocity>
+      <!-- Not: Humble diff_drive eklentisi hız limiti etiketi okumaz; 2.0 m/s ve 1.5 rad/s
+           limitleri follower_node'da (v_max, w_max) uygulanır. -->
       <publish_odom>true</publish_odom>
       <publish_odom_tf>false</publish_odom_tf>
       <publish_wheel_tf>false</publish_wheel_tf>
@@ -223,6 +225,24 @@
       <xyz_offset>0 0 0</xyz_offset>
       <rpy_offset>0 0 0</rpy_offset>
     </plugin>
+  </gazebo>
+
+  <!-- Çarpışma algılama: gövde kutusunun temasları /robot/bumper'a yayınlanır -->
+  <gazebo reference="base_link">
+    <sensor name="bumper" type="contact">
+      <always_on>true</always_on>
+      <update_rate>50</update_rate>
+      <contact>
+        <collision>base_link_collision</collision>
+      </contact>
+      <plugin name="bumper_plugin" filename="libgazebo_ros_bumper.so">
+        <ros>
+          <namespace>/robot</namespace>
+          <remapping>bumper_states:=bumper</remapping>
+        </ros>
+        <frame_name>base_link</frame_name>
+      </plugin>
+    </sensor>
   </gazebo>
 
   <!-- LiDAR Gazebo sensor -->

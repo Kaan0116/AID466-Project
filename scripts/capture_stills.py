@@ -1,293 +1,317 @@
 #!/usr/bin/env python3
 """
-capture_stills.py — Her hedef mesafe için koridor fotoğrafı çeker.
+capture_stills.py — STEP 5: one rear-camera + one overview still per target gap.
 
-Kullanım:
-  # gzserver zaten çalışıyor olmalı (simulation.launch.py ile başlatılmış):
-  python3 capture_stills.py
+Run it through the launch file (it starts Gazebo without a follower, so this script owns the
+ONLY follower_node):
+    ros2 launch following_study capture_stills.launch.py [gui:=false]
 
-Çıktılar:
-  ~/ros2_ws/results/stills/rear_gap_{gap:.1f}m.png
-  ~/ros2_ws/results/stills/overview_gap_{gap:.1f}m.png
-  ~/ros2_ws/results/stills/capture_log.csv
-  ~/ros2_ws/results/stills/contact_sheet.png
+For every gap in study_params.yaml (study.stills.gaps):
+  1. delete + respawn the person (static) and the robot (spawn_offset behind the target)
+  2. start follower_node (v_person = 0) and wait for /follower/steady (simulation time)
+  3. stop the follower, send a zero command, wait settle_time
+  4. compute the actual gap from /person/odom and /robot/odom (shared geometry module);
+     retry (restart the follower) if it is outside +-tolerance
+  5. save frames whose timestamp is after the settle point:
+       rear_gap_{gap:.1f}m.png, overview_gap_{gap:.1f}m.png
+Outputs: capture_log.csv (poses, gaps, image stamps), contact_sheet.png (rear + overview).
 """
 
+import argparse
+import csv
 import os
+import signal
+import subprocess
 import sys
 import time
-import csv
-import subprocess
-import threading
-import argparse
 
-import rclpy
-from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import Bool, Float64
-from sensor_msgs.msg import Image
-from gazebo_msgs.srv import DeleteEntity, SpawnEntity
 import cv2
 import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.utilities import remove_ros_args
+from ament_index_python.packages import get_package_prefix
 from cv_bridge import CvBridge
-from ament_index_python.packages import get_package_share_directory
+from gazebo_msgs.srv import DeleteEntity, SpawnEntity
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image
+from std_msgs.msg import Bool, Float64
+
+from following_study import study_config
+from following_study.geometry import relation, robot_spawn_x
 
 
-TARGET_GAPS  = [0.4, 0.6, 0.9, 1.2, 1.5, 2.0, 3.0]
-OUTPUT_DIR   = os.path.expanduser('~/ros2_ws/results/stills')
-LOG_CSV      = os.path.join(OUTPUT_DIR, 'capture_log.csv')
-TOLERANCE    = 0.03   # ± m
-
-PERSON_X     = 10.0   # kişi spawn konumu
-PERSON_RADIUS= 0.225  # m
-ROBOT_HALF   = 0.255  # m (base_length/2)
-ROBOT_Z      = 0.225  # m (zemin üstü yükseklik)
+def stamp_s(msg) -> float:
+    return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
 
-def _read_sdf(path: str) -> str:
-    with open(path) as f:
-        return f.read()
+class StillsCapture(Node):
 
-
-class StillsNode(Node):
-
-    def __init__(self, pkg_share: str, urdf_path: str):
+    def __init__(self, cfg_path: str, out_dir: str, gaps=None):
         super().__init__('stills_capture')
-        self.bridge     = CvBridge()
-        self.pkg_share  = pkg_share
-        self.urdf_path  = urdf_path
-        self.person_sdf = os.path.join(pkg_share, 'models', 'person', 'model.sdf')
+        self.cfg_path = cfg_path
+        self.cfg = study_config.load(cfg_path)
+        self.fp = study_config.follower_params(self.cfg)
+        self.spawn_cfg = study_config.study(self.cfg)['spawn']
+        self.sc = study_config.study(self.cfg)['stills']
+        self.gaps = [float(g) for g in (gaps or self.sc['gaps'])]
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
 
-        self._steady  = False
-        self._gap     = None
-        self._rear    = None
-        self._over    = None
-        self._follower_proc = None
+        share = os.path.join(get_package_prefix('following_study'), 'share', 'following_study')
+        with open(os.path.join(share, 'models', 'person', 'model.sdf')) as f:
+            self.person_xml = f.read()
+        with open(os.path.join(share, 'urdf', 'robot.urdf')) as f:
+            self.robot_xml = f.read()
+        self.follower_exe = os.path.join(get_package_prefix('following_study'),
+                                         'lib', 'following_study', 'follower_node')
 
-        self.create_subscription(Bool,   '/follower/steady',          self._steady_cb, 10)
-        self.create_subscription(Float64,'/follower/gap',              self._gap_cb,    10)
-        self.create_subscription(Image,  '/person/rear_cam/image_raw', self._rear_cb,   10)
-        self.create_subscription(Image,  '/overview_cam/image_raw',    self._over_cb,   10)
+        self.bridge = CvBridge()
+        self.person = None
+        self.robot = None
+        self.rear = None
+        self.over = None
+        self.steady = False
+        self.follower_gap_seen = False
+        self.follower = None
 
-        self._delete_cli = self.create_client(DeleteEntity, '/delete_entity')
-        self._spawn_cli  = self.create_client(SpawnEntity,  '/spawn_entity')
+        self.create_subscription(Odometry, '/person/odom', lambda m: setattr(self, 'person', m), 10)
+        self.create_subscription(Odometry, '/robot/odom', lambda m: setattr(self, 'robot', m), 10)
+        self.create_subscription(Image, '/person/rear_cam/image_raw',
+                                 lambda m: setattr(self, 'rear', m), 2)
+        self.create_subscription(Image, '/overview_cam/image_raw',
+                                 lambda m: setattr(self, 'over', m), 2)
+        self.create_subscription(Bool, '/follower/steady', self._steady_cb, 10)
+        self.create_subscription(Float64, '/follower/gap', self._gap_cb, 10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.delete_cli = self.create_client(DeleteEntity, '/delete_entity')
+        self.spawn_cli = self.create_client(SpawnEntity, '/spawn_entity')
 
-    def _steady_cb(self, m): self._steady = m.data
-    def _gap_cb(self, m):    self._gap    = m.data
-    def _rear_cb(self, m):   self._rear   = m
-    def _over_cb(self, m):   self._over   = m
+    # ------------------------------------------------------------------ helpers
+    def _steady_cb(self, m):
+        self.steady = m.data
 
-    def _wait_for_services(self):
-        for cli in [self._delete_cli, self._spawn_cli]:
-            while not cli.wait_for_service(timeout_sec=2.0):
-                self.get_logger().info(f'{cli.srv_name} bekleniyor...')
+    def _gap_cb(self, _):
+        self.follower_gap_seen = True
 
-    def _delete_entity(self, name: str):
-        req = DeleteEntity.Request()
-        req.name = name
-        fut = self._delete_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
+    def now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
-    def _spawn_entity(self, name: str, xml: str, x: float, y=0.0, z=0.0):
-        req = SpawnEntity.Request()
-        req.name            = name
-        req.xml             = xml
-        req.initial_pose.position.x = x
-        req.initial_pose.position.y = y
-        req.initial_pose.position.z = z
-        req.reference_frame = 'world'
-        fut = self._spawn_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
-        if fut.result() and fut.result().success:
-            self.get_logger().info(f'Spawn OK: {name} @ x={x:.2f}')
-        else:
-            self.get_logger().warn(f'Spawn BAŞARISIZ: {name}')
-
-    def _start_follower(self, target_gap: float, v_person=0.0):
-        """Follower node'u subprocess olarak başlat."""
-        if self._follower_proc and self._follower_proc.poll() is None:
-            self._follower_proc.terminate()
-            self._follower_proc.wait(timeout=5)
-
-        self._steady = False
-        self._gap    = None
-
-        cmd = [
-            'ros2', 'run', 'following_study', 'follower_node',
-            '--ros-args',
-            '-p', f'target_gap:={target_gap}',
-            '-p', f'v_person:={v_person}',
-            '-p', 'kp_gap:=4.0',
-            '-p', 'kp_heading:=2.0',
-            '-p', 'v_max:=1.5',
-        ]
-        self._follower_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    def _stop_follower(self):
-        if self._follower_proc and self._follower_proc.poll() is None:
-            self._follower_proc.terminate()
-            try:
-                self._follower_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._follower_proc.kill()
-        # Robotu durdur
-        import rclpy
-        from geometry_msgs.msg import Twist
-        pub = self.create_publisher(Twist, '/cmd_vel', 1)
-        pub.publish(Twist())
-        time.sleep(0.5)
-        self.destroy_publisher(pub)
-
-    def wait_for_steady(self, timeout=60.0) -> bool:
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if self._steady:
+    def wait_until(self, pred, sim_timeout: float, wall_timeout: float = None) -> bool:
+        """Spin (single thread) until pred() is true or the timeout elapses."""
+        t_sim0, t_wall0 = self.now(), time.time()
+        wall_timeout = wall_timeout or (sim_timeout * 10.0 + 30.0)
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if pred():
                 return True
+            if self.now() - t_sim0 > sim_timeout or time.time() - t_wall0 > wall_timeout:
+                return False
         return False
 
-    def grab_images(self):
-        """Son gelen kareleri döndür."""
-        for _ in range(20):
-            rclpy.spin_once(self, timeout_sec=0.1)
-        return self._rear, self._over, self._gap
+    def sleep_sim(self, seconds: float):
+        t0 = self.now()
+        self.wait_until(lambda: self.now() - t0 >= seconds, seconds + 1.0)
 
-    def run_all_gaps(self):
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        self._wait_for_services()
+    def call(self, client, req, what: str):
+        fut = client.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=15.0)
+        res = fut.result()
+        if res is None or not res.success:
+            msg = res.status_message if res else 'timeout'
+            self.get_logger().warn(f'{what}: {msg}')
+            return False
+        return True
 
-        with open(OUTPUT_DIR + '/robot.urdf') as f:
-            robot_xml = f.read()
-        person_xml = _read_sdf(self.person_sdf)
+    # ------------------------------------------------------------------ steps
+    def ensure_single_follower(self):
+        """Refuse to run if another follower_node is alive (the old two-follower bug)."""
+        self.wait_until(lambda: False, sim_timeout=1e9, wall_timeout=2.0)   # discovery
+        names = [n for n, _ in self.get_node_names_and_namespaces()]
+        if 'follower_node' in names:
+            raise RuntimeError(
+                'Another follower_node is running. Start Gazebo with start_follower:=false '
+                '(capture_stills.launch.py does this) so this script owns the only follower.')
 
-        log_rows = []
+    def respawn(self, target_gap: float):
+        for name in ('person', 'study_robot'):
+            req = DeleteEntity.Request()
+            req.name = name
+            fut = self.delete_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)   # may not exist yet
+        self.sleep_sim(0.5)
 
-        for target_gap in TARGET_GAPS:
-            self.get_logger().info(f'\n=== target_gap={target_gap:.1f}m ===')
+        robot_x = robot_spawn_x(self.sc_person_x, target_gap, self.fp['person_back_offset'],
+                                self.fp['robot_front_offset'], self.spawn_cfg['spawn_offset'])
+        for name, xml, x, z in (('person', self.person_xml, self.sc_person_x, 0.0),
+                                ('study_robot', self.robot_xml, robot_x,
+                                 self.spawn_cfg['robot_z'])):
+            req = SpawnEntity.Request()
+            req.name, req.xml, req.reference_frame = name, xml, 'world'
+            req.initial_pose.position.x = float(x)
+            req.initial_pose.position.z = float(z)
+            if not self.call(self.spawn_cli, req, f'spawn {name}'):
+                raise RuntimeError(f'could not spawn {name}')
+        t_spawn = self.now()
+        ok = self.wait_until(lambda: self.person is not None and self.robot is not None
+                             and stamp_s(self.person) > t_spawn and stamp_s(self.robot) > t_spawn,
+                             sim_timeout=10.0)
+        if not ok:
+            raise RuntimeError('no ground-truth odometry after spawn')
+        self.sleep_sim(1.0)   # let the robot settle on its wheels
 
-            # 1. Eski entity'leri temizle
-            self._delete_entity('person')
-            self._delete_entity('study_robot')
-            time.sleep(1.5)
+    def start_follower(self, target_gap: float):
+        self.stop_follower()
+        self.steady = False
+        self.follower_gap_seen = False
+        log_csv = os.path.join(self.out_dir, f'follower_gap_{target_gap:.1f}m.csv')
+        cmd = [self.follower_exe, '--ros-args', '--params-file', self.cfg_path,
+               '-p', f'target_gap:={target_gap}', '-p', 'v_person:=0.0',
+               '-p', 'use_sim_time:=true', '-p', f'log_csv:={log_csv}']
+        self.follower = subprocess.Popen(cmd, start_new_session=True)
 
-            # 2. Robot başlangıç konumu: kişinin arkasında, yaklaşık olarak
-            robot_x = PERSON_X - PERSON_RADIUS - target_gap - ROBOT_HALF - 0.5
-            robot_x = max(0.5, robot_x)
+    def stop_follower(self):
+        if self.follower and self.follower.poll() is None:
+            os.killpg(self.follower.pid, signal.SIGINT)
+            try:
+                self.follower.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.follower.pid, signal.SIGKILL)
+        self.follower = None
+        for _ in range(5):
+            self.cmd_pub.publish(Twist())
+            rclpy.spin_once(self, timeout_sec=0.02)
 
-            self._spawn_entity('person',      person_xml, PERSON_X, 0.0, 0.0)
-            self._spawn_entity('study_robot', robot_xml,  robot_x,  0.0, ROBOT_Z)
-            time.sleep(2.0)
-
-            # 3. Follower başlat
-            self._start_follower(target_gap, v_person=0.0)
-
-            # 4. Steady-state bekle
-            ok = self.wait_for_steady(timeout=60.0)
+    def capture_gap(self, target_gap: float) -> dict:
+        tol = self.sc['tolerance']
+        self.respawn(target_gap)
+        row = None
+        for attempt in range(1, self.sc['max_attempts'] + 1):
+            self.start_follower(target_gap)
+            ok = self.wait_until(lambda: self.follower_gap_seen and self.steady,
+                                 sim_timeout=self.sc['steady_timeout'])
             if not ok:
-                self.get_logger().warn(f'Zaman aşımı! gap={target_gap:.1f}m — devam ediyorum.')
+                self.get_logger().warn(f'gap={target_gap:.1f}: steady_state not reached '
+                                       f'(attempt {attempt})')
+            self.stop_follower()
+            self.sleep_sim(self.sc['settle_time'])
+            t_settled = self.now()
 
-            # 5. Follower durdur, osilasyonun geçmesini bekle
-            self._stop_follower()
-            time.sleep(0.5)
+            # fresh poses and frames, all stamped after the settle point
+            got = self.wait_until(
+                lambda: (stamp_s(self.person) >= t_settled and stamp_s(self.robot) >= t_settled
+                         and self.rear is not None and self.over is not None
+                         and stamp_s(self.rear) >= t_settled and stamp_s(self.over) >= t_settled),
+                sim_timeout=5.0)
+            if not got:
+                raise RuntimeError('no fresh odometry/images after settling')
+            person, robot, rear, over = self.person, self.robot, self.rear, self.over
+            rel = relation(person.pose.pose, robot.pose.pose,
+                           self.fp['person_back_offset'], self.fp['robot_front_offset'])
+            within = abs(rel.gap - target_gap) <= tol
+            self.get_logger().info(
+                f'gap={target_gap:.1f}: actual={rel.gap:.4f} m '
+                f'(err {rel.gap - target_gap:+.4f}) steady={ok} '
+                f'{"OK" if within else "OUT OF TOLERANCE"}')
+            row = {
+                'target_gap': f'{target_gap:.1f}', 'actual_gap': f'{rel.gap:.4f}',
+                'error': f'{rel.gap - target_gap:+.4f}', 'within_tolerance': within,
+                'tolerance': tol, 'steady_reached': ok, 'attempt': attempt,
+                'person_x': f'{person.pose.pose.position.x:.4f}',
+                'person_y': f'{person.pose.pose.position.y:.4f}',
+                'person_yaw': f'{rel.person_yaw:.4f}',
+                'robot_x': f'{robot.pose.pose.position.x:.4f}',
+                'robot_y': f'{robot.pose.pose.position.y:.4f}',
+                'robot_yaw': f'{rel.robot_yaw:.4f}',
+                'lateral': f'{rel.lateral:.4f}',
+                'pose_stamp': f'{stamp_s(person):.3f}',
+                'rear_stamp': f'{stamp_s(rear):.3f}', 'overview_stamp': f'{stamp_s(over):.3f}',
+                'rear_image': f'rear_gap_{target_gap:.1f}m.png',
+                'overview_image': f'overview_gap_{target_gap:.1f}m.png',
+                'image_width': rear.width, 'image_height': rear.height,
+            }
+            if within:
+                break
+        cv2.imwrite(os.path.join(self.out_dir, row['rear_image']),
+                    self.bridge.imgmsg_to_cv2(rear, 'bgr8'))
+        cv2.imwrite(os.path.join(self.out_dir, row['overview_image']),
+                    self.bridge.imgmsg_to_cv2(over, 'bgr8'))
+        return row
 
-            # 6. Görüntü al
-            rear_msg, over_msg, actual_gap = self.grab_images()
+    def run(self):
+        self.sc_person_x = float(self.spawn_cfg['person_x'])
+        for cli in (self.delete_cli, self.spawn_cli):
+            while not cli.wait_for_service(timeout_sec=2.0):
+                self.get_logger().info(f'waiting for {cli.srv_name} ...')
+        self.wait_until(lambda: self.now() > 0.0, sim_timeout=1e9, wall_timeout=60.0)
+        self.ensure_single_follower()
 
-            rear_path = os.path.join(OUTPUT_DIR, f'rear_gap_{target_gap:.1f}m.png')
-            over_path = os.path.join(OUTPUT_DIR, f'overview_gap_{target_gap:.1f}m.png')
+        rows = []
+        try:
+            for g in self.gaps:
+                rows.append(self.capture_gap(g))
+        finally:
+            self.stop_follower()
+            if rows:
+                path = os.path.join(self.out_dir, 'capture_log.csv')
+                with open(path, 'w', newline='') as f:
+                    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                    w.writeheader()
+                    w.writerows(rows)
+                self.get_logger().info(f'log: {path}')
+        build_contact_sheet(self.out_dir, self.gaps)
+        bad = [r['target_gap'] for r in rows if not r['within_tolerance']]
+        if bad:
+            self.get_logger().error(f'out of tolerance: {bad}')
+        return not bad
 
-            if rear_msg:
-                cv2.imwrite(rear_path, self.bridge.imgmsg_to_cv2(rear_msg, 'bgr8'))
-            else:
-                self.get_logger().warn('Arka kamera görüntüsü alınamadı!')
 
-            if over_msg:
-                cv2.imwrite(over_path, self.bridge.imgmsg_to_cv2(over_msg, 'bgr8'))
-            else:
-                self.get_logger().warn('Genel bakış görüntüsü alınamadı!')
-
-            # 7. Doğrula
-            if actual_gap is not None:
-                within = abs(actual_gap - target_gap) <= TOLERANCE
-                status = 'OK' if within else f'TOLERANS_DIŞI (Δ={abs(actual_gap-target_gap):.3f}m)'
-                self.get_logger().info(
-                    f'  actual_gap={actual_gap:.3f}m  hedef={target_gap:.1f}m  [{status}]')
-            else:
-                within  = False
-                actual_gap = float('nan')
-
-            log_rows.append({
-                'target_gap':       target_gap,
-                'actual_gap':       f'{actual_gap:.4f}',
-                'within_tolerance': within,
-                'steady_reached':   ok,
-                'rear_image':       os.path.basename(rear_path),
-                'overview_image':   os.path.basename(over_path),
-            })
-
-        # CSV yaz
-        with open(LOG_CSV, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(log_rows[0].keys()))
-            w.writeheader()
-            w.writerows(log_rows)
-        self.get_logger().info(f'Log: {LOG_CSV}')
-
-        # Contact sheet
-        self._build_contact_sheet()
-
-    def _build_contact_sheet(self):
-        imgs = []
-        for g in TARGET_GAPS:
-            p = os.path.join(OUTPUT_DIR, f'rear_gap_{g:.1f}m.png')
-            img = cv2.imread(p)
+def build_contact_sheet(out_dir: str, gaps, cols: int = 4, thumb_w: int = 427):
+    """Rear stills (top block) and overview stills (bottom block), labelled per gap."""
+    blocks = []
+    for kind in ('rear', 'overview'):
+        thumbs = []
+        for g in gaps:
+            img = cv2.imread(os.path.join(out_dir, f'{kind}_gap_{g:.1f}m.png'))
             if img is None:
-                img = np.zeros((240, 427, 3), dtype=np.uint8)
-            else:
-                img = cv2.resize(img, (427, 240))
-            cv2.putText(img, f'gap={g:.1f}m', (8, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            imgs.append(img)
-
-        # 2 x 4 ızgara (7 resim, son hücre boş)
-        while len(imgs) % 4 != 0:
-            imgs.append(np.zeros_like(imgs[0]))
-
-        rows = [np.hstack(imgs[i:i+4]) for i in range(0, len(imgs), 4)]
-        sheet = np.vstack(rows)
-        out = os.path.join(OUTPUT_DIR, 'contact_sheet.png')
-        cv2.imwrite(out, sheet)
-        self.get_logger().info(f'Contact sheet: {out}')
+                img = np.zeros((720, 1280, 3), np.uint8)
+            h = int(round(img.shape[0] * thumb_w / img.shape[1]))
+            img = cv2.resize(img, (thumb_w, h))
+            label = np.full((30, thumb_w, 3), 255, np.uint8)
+            cv2.putText(label, f'{kind}  gap={g:.1f} m', (6, 21),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            thumbs.append(np.vstack([label, img]))
+        while len(thumbs) % cols:
+            thumbs.append(np.full_like(thumbs[0], 255))
+        blocks += [np.hstack(thumbs[i:i + cols]) for i in range(0, len(thumbs), cols)]
+    path = os.path.join(out_dir, 'contact_sheet.png')
+    cv2.imwrite(path, np.vstack(blocks))
+    return path
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--pkg-share', default='',
-                        help='following_study share dizini (otomatik bulunur)')
-    args = parser.parse_args()
+    argv = remove_ros_args(sys.argv)[1:]
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--out-dir', default=os.path.expanduser('~/ros2_ws/results/stills'))
+    ap.add_argument('--params-file', default='')
+    ap.add_argument('--gaps', nargs='+', type=float, help='override study.stills.gaps')
+    args = ap.parse_args(argv)
 
-    pkg_share = args.pkg_share or get_package_share_directory('following_study')
-    urdf_path = os.path.join(pkg_share, 'urdf', 'robot.urdf')
-
-    # robot.urdf'i OUTPUT_DIR'e kopyala (spawn için)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    import shutil
-    shutil.copy(urdf_path, os.path.join(OUTPUT_DIR, 'robot.urdf'))
-
-    rclpy.init()
-    node = StillsNode(pkg_share, urdf_path)
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    spin_thread.start()
-
+    rclpy.init(args=sys.argv)
+    node = StillsCapture(args.params_file or study_config.default_config_path(),
+                         os.path.expanduser(args.out_dir), args.gaps)
+    ok = False
     try:
-        node.run_all_gaps()
+        ok = node.run()
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_follower()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':

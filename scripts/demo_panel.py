@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
 demo_panel.py — HRI Demo Paneli (kompakt)
-Kullanım: python3 demo_panel.py
+
+Simülasyonu kişi sürücüsü OLMADAN başlat (panel kişiyi kendisi yürütür), follower açık kalsın:
+  ros2 launch following_study simulation.launch.py start_driver:=false person_speed:=0.0
+  ros2 run following_study demo_panel.py
+Panel yeni bir follower başlatmaz; çalışan follower_node'un target_gap / v_person
+parametrelerini değiştirir (aynı anda iki follower olmaması için).
 """
 
 import threading
 import subprocess
+
+from following_study import study_config
 
 import rclpy
 from rclpy.node import Node
@@ -21,7 +28,7 @@ from tkinter import font as tkfont
 from PIL import Image as PILImage, ImageTk
 
 DISTANCES    = [0.6, 0.9, 1.2, 1.5, 2.0]
-PERSON_SPEED = 0.8
+PERSON_SPEED = float(study_config.study(study_config.load())['clips']['person_speed'])
 CAM_W, CAM_H = 480, 270
 UPDATE_MS    = 100   # 10 fps
 
@@ -36,7 +43,6 @@ class DemoNode(Node):
         self.over_img   = None
         self.walking    = False
         self.target_gap = 1.2
-        self._follower_proc = None
 
         self._person_cmd = self.create_publisher(Twist, '/person/cmd_vel', 10)
         self._robot_stop = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -70,27 +76,24 @@ class DemoNode(Node):
             cmd.linear.x = float(PERSON_SPEED)
         self._person_cmd.publish(cmd)
 
-    def set_target_gap(self, gap: float):
-        self.target_gap = gap
+    def _set_param(self, name, value):
         subprocess.Popen(
-            ['ros2', 'param', 'set', '/follower_node', 'target_gap', str(gap)],
+            ['ros2', 'param', 'set', '/follower_node', name, str(float(value))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def start_follower(self):
-        if self._follower_proc and self._follower_proc.poll() is None:
-            return
-        cmd = ['ros2', 'run', 'following_study', 'follower_node',
-               '--ros-args',
-               '-p', f'target_gap:={self.target_gap}',
-               '-p', 'kp_gap:=4.0',
-               '-p', 'kp_heading:=2.0',
-               '-p', 'v_max:=1.5']
-        self._follower_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def set_target_gap(self, gap: float):
+        self.target_gap = gap
+        self._set_param('target_gap', gap)
+
+    def set_walking(self, walking: bool):
+        """Person speed and follower feed-forward always change together."""
+        self.walking = walking
+        self._set_param('v_person', PERSON_SPEED if walking else 0.0)
+
+    def follower_running(self) -> bool:
+        return 'follower_node' in [n for n, _ in self.get_node_names_and_namespaces()]
 
     def stop_follower(self):
-        if self._follower_proc and self._follower_proc.poll() is None:
-            self._follower_proc.terminate()
         self._robot_stop.publish(Twist())
 
     def destroy_node(self):
@@ -151,9 +154,6 @@ class DemoPanel:
                                    bg='#40a02b', fg='white', relief='flat', bd=0,
                                    command=self._toggle_walk)
         self._walk_btn.pack(side='left', padx=4)
-        tk.Button(cf, text='⚙ Follower', font=bf, width=10,
-                  bg='#1793d1', fg='white', relief='flat', bd=0,
-                  command=self.node.start_follower).pack(side='left', padx=4)
 
         # Durum
         sf_frame = tk.Frame(self.root, bg=self.PANEL)
@@ -209,7 +209,7 @@ class DemoPanel:
                 b.configure(bg=self.PANEL, fg=self.TEXT)
 
     def _toggle_walk(self):
-        self.node.walking = not self.node.walking
+        self.node.set_walking(not self.node.walking)
         if self.node.walking:
             self._walk_btn.configure(text='⏸ Durdur', bg=self.RED)
         else:
@@ -224,7 +224,9 @@ class DemoPanel:
             self._lbl_error.configure(
                 text=f'Hata: {err:+.3f}m',
                 fg=self.GREEN if abs(err) < 0.05 else self.RED)
-        if self.node.steady:
+        if not self.node.follower_running():
+            self._lbl_steady.configure(text='follower_node yok!', fg=self.RED)
+        elif self.node.steady:
             self._lbl_steady.configure(text='Durum: ✓ KARARLI', fg=self.GREEN)
         else:
             self._lbl_steady.configure(text='Durum: ⟳ Yakınlaşıyor', fg=self.YELLOW)
